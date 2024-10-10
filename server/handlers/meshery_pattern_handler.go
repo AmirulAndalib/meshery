@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,10 +27,10 @@ import (
 	"github.com/layer5io/meshery/server/models"
 	pCore "github.com/layer5io/meshery/server/models/pattern/core"
 	"github.com/layer5io/meshery/server/models/pattern/resource/selector"
-	"github.com/layer5io/meshery/server/models/pattern/stages"
 	patternutils "github.com/layer5io/meshery/server/models/pattern/utils"
 	"github.com/layer5io/meshkit/encoding"
 	"github.com/layer5io/meshkit/errors"
+	"github.com/layer5io/meshkit/models/converter"
 	_errors "github.com/pkg/errors"
 
 	"github.com/layer5io/meshkit/logger"
@@ -43,6 +44,7 @@ import (
 	"github.com/layer5io/meshkit/utils/kubernetes/kompose"
 	"github.com/layer5io/meshkit/utils/walker"
 
+	regv1beta1 "github.com/layer5io/meshkit/models/meshmodel/registry/v1beta1"
 	"github.com/meshery/schemas/models/v1alpha2"
 	"github.com/meshery/schemas/models/v1beta1/component"
 	"github.com/meshery/schemas/models/v1beta1/connection"
@@ -273,14 +275,6 @@ func (h *Handler) handlePatternPOST(
 			// then fall back to importing design as yaml file
 			if err != nil {
 				h.log.Info("Falling back to importing design as yaml file")
-
-				// commenting for now as every save event would other wise send following event
-				// event := eventBuilder.WithSeverity(events.Warning).WithMetadata(map[string]interface{}{
-				// 	"error": ErrUnCompressOCIArtifact(err),
-				// }).WithDescription(fmt.Sprintf("Failed uncompressing OCI Artifact %s into Design YAML. Falling back to importing design as YAML.", mesheryPattern.Name)).Build()
-				// _ = provider.PersistEvent(event)
-				// go h.config.EventBroadcaster.Publish(userID, event)
-				//
 			} else {
 				h.log.Info("OCI Artifact decompressed.")
 				event := eventBuilder.WithSeverity(events.Informational).WithDescription(fmt.Sprintf("OCI Artifact decompressed into %s design file", mesheryPattern.Name)).Build()
@@ -322,7 +316,8 @@ func (h *Handler) handlePatternPOST(
 				h.formatPatternOutput(rw, resp, format, sourcetype, eventBuilder, parsedBody.URL, action)
 				event := eventBuilder.Build()
 				_ = provider.PersistEvent(event)
-				go h.config.EventBroadcaster.Publish(userID, event)
+				// Create the event but do not notify the client immediately, as the evaluations are frequent and takes up the view area.
+				// go h.config.EventBroadcaster.Publish(userID, event)
 				go h.config.PatternChannel.Publish(uuid.FromStringOrNil(user.ID), struct{}{})
 				return
 			}
@@ -348,6 +343,9 @@ func (h *Handler) handlePatternPOST(
 		if sourcetype == string(models.HelmChart) {
 			helmSourceResp, err := http.Get(parsedBody.URL)
 			defer func() {
+				if helmSourceResp == nil {
+					return
+				}
 				_ = helmSourceResp.Body.Close()
 			}()
 			if err != nil {
@@ -411,7 +409,7 @@ func (h *Handler) handlePatternPOST(
 
 				return
 			}
-			bytPattern, _ := yaml.Marshal(pattern)
+			bytPattern, _ := encoding.Marshal(pattern)
 
 			mesheryPattern = &models.MesheryPattern{
 				Name:        parsedBody.Name,
@@ -718,7 +716,7 @@ func unCompressOCIArtifactIntoDesign(artifact []byte) (*models.MesheryPattern, e
 	// TODO: Add support to merge multiple designs into one
 	// Currently, assumes to save only the first design
 	if len(files) == 0 {
-		return nil, ErrEmptyOCIImage(fmt.Errorf("No design file detected in the imported OCI image"))
+		return nil, ErrEmptyOCIImage(fmt.Errorf("no design file detected in the imported OCI image"))
 	}
 	design := files[0]
 
@@ -769,7 +767,7 @@ func githubRepoDesignScan(
 					return err //always a meshkit error
 				}
 
-				patternByt, _ := yaml.Marshal(pattern)
+				patternByt, _ := encoding.Marshal(pattern)
 
 				af := models.MesheryPattern{
 					Name:        strings.TrimSuffix(f.Name, ext),
@@ -843,7 +841,7 @@ func genericHTTPDesignFile(fileURL, patternName, sourceType string, reg *meshmod
 		pattern.Name = patternName
 	}
 
-	patternByt, _ := yaml.Marshal(pattern)
+	patternByt, _ := encoding.Marshal(pattern)
 
 	url := strings.Split(fileURL, "/")
 	af := models.MesheryPattern{
@@ -1023,6 +1021,8 @@ func (h *Handler) DeleteMesheryPatternHandler(
 // Handle GET request for Meshery Pattern with the given id
 //
 // ?oci={true|false} - If true, returns the pattern in OCI Artifact format
+// ?export={Kubernetes Manifest} - exports the pattern file in the specified design format
+// ?pkg={true|false} - If true, returns the artifact hub pkg and pattern file in zip file. If "oci" is true, "pkg" is ignored and the export always contains the artifact hub pkg.
 //
 // Get the pattern with the given id
 // responses:
@@ -1037,9 +1037,21 @@ func (h *Handler) DownloadMesheryPatternHandler(
 	user *models.User,
 	provider models.Provider,
 ) {
-
+	var formatConverter converter.ConvertFormat
 	userID := uuid.FromStringOrNil(user.ID)
 	eventBuilder := events.NewEvent().FromUser(userID).FromSystem(*h.SystemID).WithCategory("pattern").WithAction("download").ActedUpon(userID).WithSeverity(events.Informational)
+
+	exportFormat := r.URL.Query().Get("export")
+	if exportFormat != "" {
+		var errConvert error
+		formatConverter, errConvert = converter.NewFormatConverter(converter.DesignFormat(exportFormat))
+		if errConvert != nil {
+			err := ErrExportPatternInFormat(errConvert, exportFormat, "")
+			h.log.Error(err)
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 
 	patternID := mux.Vars(r)["id"]
 	ociFormat, _ := strconv.ParseBool(r.URL.Query().Get("oci"))
@@ -1109,6 +1121,26 @@ func (h *Handler) DownloadMesheryPatternHandler(
 		}
 
 		pattern.PatternFile = patternFileStr
+	}
+
+	if formatConverter != nil {
+		patternFile, err := formatConverter.Convert(pattern.PatternFile)
+		if err != nil {
+			err = ErrExportPatternInFormat(err, exportFormat, pattern.Name)
+			h.log.Error(err)
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		rw.Header().Add("Content-Disposition", fmt.Sprintf("attachment;filename=%s.yml", pattern.Name))
+		rw.Header().Set("Content-Type", "application/yaml")
+		_, err = fmt.Fprint(rw, patternFile)
+		if err != nil {
+			err = ErrWriteResponse(err)
+			h.log.Error(err)
+			http.Error(rw, _errors.Wrapf(err, "failed to export design \"%s\" in %s format", pattern.Name, exportFormat).Error(), http.StatusInternalServerError)
+			return
+		}
+		return
 	}
 
 	if ociFormat {
@@ -1363,6 +1395,8 @@ func (h *Handler) DownloadMesheryPatternHandler(
 	}
 
 	rw.Header().Set("Content-Type", "application/yaml")
+	rw.Header().Add("Content-Disposition", fmt.Sprintf("attachment;filename=%s.yml", pattern.Name))
+
 	err = yaml.NewEncoder(rw).Encode(unmarshalledPatternFile)
 	if err != nil {
 		err = ErrEncodePattern(err)
@@ -1457,20 +1491,19 @@ func (h *Handler) CloneMesheryPatternHandler(
 			return
 		}
 		pattern.PatternFile = patternFileStr
-	}
+		_, err = provider.SaveMesheryPattern(token, pattern)
+		if err != nil {
+			h.log.Error(ErrSavePattern(err))
+			http.Error(rw, ErrSavePattern(err).Error(), http.StatusInternalServerError)
 
-	_, err = provider.SaveMesheryPattern(token, pattern)
-	if err != nil {
-		h.log.Error(ErrSavePattern(err))
-		http.Error(rw, ErrSavePattern(err).Error(), http.StatusInternalServerError)
+			event := eventBuilder.WithSeverity(events.Error).WithMetadata(map[string]interface{}{
+				"error": ErrSavePattern(_errors.Wrapf(err, "failed to persist converted v1beta1 design file \"%s\" with id: %s", parsedBody.Name, patternID)),
+			}).WithDescription(ErrSavePattern(err).Error()).Build()
 
-		event := eventBuilder.WithSeverity(events.Error).WithMetadata(map[string]interface{}{
-			"error": ErrSavePattern(_errors.Wrapf(err, "failed to persist converted v1beta1 design file \"%s\" with id: %s", parsedBody.Name, patternID)),
-		}).WithDescription(ErrSavePattern(err).Error()).Build()
-
-		_ = provider.PersistEvent(event)
-		go h.config.EventBroadcaster.Publish(userID, event)
-		return
+			_ = provider.PersistEvent(event)
+			go h.config.EventBroadcaster.Publish(userID, event)
+			return
+		}
 	}
 
 	resp, err := provider.CloneMesheryPattern(r, patternID, parsedBody)
@@ -1743,7 +1776,10 @@ func (h *Handler) GetMesheryPatternHandler(
 	}
 
 	rw.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(rw).Encode(pattern)
+	if err := json.NewEncoder(rw).Encode(pattern); err != nil {
+		http.Error(rw, "Failed to encode response", http.StatusInternalServerError)
+		return
+	}
 }
 
 func (h *Handler) formatPatternOutput(rw http.ResponseWriter, content []byte, format, sourcetype string, eventBuilder *events.EventBuilder, URL, action string) {
@@ -1784,28 +1820,28 @@ func (h *Handler) formatPatternOutput(rw http.ResponseWriter, content []byte, fo
 	eventBuilder.WithDescription(response)
 	rw.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(rw, string(data))
-	// res.Details = "Design \"" + strings.Join(names, ",") + "\" imported from " + URL + " ."
-	// res.Summary = "Changes to the \"" + strings.Join(names, ",") + "\" design have been saved."
-	// go h.EventsBuffer.Publish(res)
 }
 
 // Since the client currently does not support pattern imports and externalized variables, the first(import) stage of pattern engine
 // is evaluated here to simplify the pattern file such that it is valid when a deploy takes place
-func evalImportAndReferenceStage(p *pattern.PatternFile) (newp pattern.PatternFile) {
-	chain := stages.CreateChain()
-	chain.
-		// Add(stages.Import(sip, sap)). enable this
-		Add(stages.Filler(false)).
-		Add(func(data *stages.Data, err error, next stages.ChainStageNextFunction) {
-			data.Lock.Lock()
-			newp = *data.Pattern
-			data.Lock.Unlock()
-		}).
-		Process(&stages.Data{
-			Pattern: p,
-		})
-	return newp
-}
+
+//unsued currently
+
+// func evalImportAndReferenceStage(p *pattern.PatternFile) (newp pattern.PatternFile) {
+// 	chain := stages.CreateChain()
+// 	chain.
+// 		// Add(stages.Import(sip, sap)). enable this
+// 		Add(stages.Filler(false)).
+// 		Add(func(data *stages.Data, err error, next stages.ChainStageNextFunction) {
+// 			data.Lock.Lock()
+// 			newp = *data.Pattern
+// 			data.Lock.Unlock()
+// 		}).
+// 		Process(&stages.Data{
+// 			Pattern: p,
+// 		})
+// 	return newp
+// }
 
 // Only pass Meshkit err here or there will be a panic
 func addMeshkitErr(res *meshes.EventsResponse, err error) {
@@ -2079,9 +2115,33 @@ func mapModelRelatedData(reg *meshmodel.RegistryManager, patternFile *pattern.Pa
 			continue
 		}
 
-		wc, err := s.GetDefinition(comp.Component.Kind, comp.Model.Model.Version, comp.Model.Name, comp.Component.Version)
+		wc, err := s.GetDefinition(comp.Component.Kind, comp.Model.Model.Version, comp.Model.Name, comp.Component.Version, true)
 		if err != nil {
-			return err
+			m := []string{"meshery", "meshery-core", "meshery-shapes", "meshery-flowchart"}
+			// if model is one of those defined in the slice above as meshery, and no matching defs were found,
+			// try to find the component just by name, this ensures the component is upgraded to newer model.
+			// Eg: Some old designs contains "Comment" component under "meshery" model instead of "meshery-core"
+
+			// Update the component kind to reflect the current registry.
+			// Eg: The Connection component for k8s, had "kind" updated to "KuberntesConnection",hence any designs which has model k8s and kind "Connection" will fail, to ensure it gets converted, update the kind
+			if comp.Model.Name == "kubernetes" && comp.Component.Kind == "Connection" {
+				comp.Component.Kind = "KubernetesConnection"
+			} else if comp.Model.Name == "aws" || comp.Model.Name == "gcp" {
+				comp.Component.Kind = fmt.Sprintf("%s %s", strings.ToUpper(comp.Model.Name), comp.Component.Kind)
+			} else if !slices.Contains(m, comp.Model.Name) {
+				return err
+			}
+
+			entities, _, _, _ := reg.GetEntities(&regv1beta1.ComponentFilter{
+				Name:       comp.Component.Kind,
+				APIVersion: comp.Component.Version,
+			})
+			comp, found := selector.FindCompDefinitionWithVersion(entities, comp.Model.Model.Version)
+
+			if found {
+				wc = *comp
+			}
+
 		}
 
 		comp.Model = wc.Model
@@ -2100,6 +2160,9 @@ func mapModelRelatedData(reg *meshmodel.RegistryManager, patternFile *pattern.Pa
 			comp.Model.Metadata.SvgComplete = nil
 		}
 		comp.Capabilities = wc.Capabilities
+		if comp.Capabilities == nil {
+			comp.Capabilities = models.K8sMeshModelMetadata.Capabilities
+		}
 		comp.Metadata.Genealogy = wc.Metadata.Genealogy
 		comp.Metadata.IsAnnotation = wc.Metadata.IsAnnotation
 		comp.Metadata.Published = wc.Metadata.Published
